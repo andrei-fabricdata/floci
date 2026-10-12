@@ -38,16 +38,20 @@ import java.util.Optional;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.mockito.ArgumentMatchers.any;
+import static org.mockito.ArgumentMatchers.anyString;
 import static org.mockito.ArgumentMatchers.eq;
 import static org.mockito.Mockito.RETURNS_DEEP_STUBS;
 import static org.mockito.Mockito.mock;
+import static org.mockito.Mockito.never;
+import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.when;
 
 /**
  * A Lambda Task given a function ARN invokes the function that ARN names: the one in its own
  * account and region, never a same-named function of the state machine's. The optimized
  * integration calls Lambda's Invoke in the state machine's region, which refuses an ARN from
- * another region.
+ * another region. Under IAM enforcement, the function runs only when {@link LambdaTaskAuthorizer}
+ * lets the execution role invoke it.
  */
 @QuarkusTest
 class AslExecutorLambdaArnTargetTest {
@@ -57,6 +61,7 @@ class AslExecutorLambdaArnTargetTest {
     private static final String ACCOUNT = "000000000000";
     private static final String OTHER_ACCOUNT = "111111111111";
     private static final String FUNCTION_NAME = "worker";
+    private static final String ROLE_ARN = "arn:aws:iam::" + ACCOUNT + ":role/test-role";
 
     private final ObjectMapper objectMapper = new ObjectMapper();
     private LambdaExecutorService lambdaExecutor;
@@ -83,10 +88,10 @@ class AslExecutorLambdaArnTargetTest {
                     .thenReturn(new InvokeResult(200, null, output, null, "request"));
         }
 
-        executor = newExecutor(mock(EmulatorConfig.class));
+        executor = newExecutor(mock(EmulatorConfig.class), null);
     }
 
-    private AslExecutor newExecutor(EmulatorConfig config) {
+    private AslExecutor newExecutor(EmulatorConfig config, LambdaTaskAuthorizer authorizer) {
         return new AslExecutor(
                 lambdaExecutor,
                 new LambdaTargetResolver(functionStore, mock(LambdaAliasStore.class)),
@@ -104,7 +109,7 @@ class AslExecutorLambdaArnTargetTest {
                 null,
                 objectMapper,
                 new JsonataEvaluator(objectMapper),
-                mock(Instance.class), config, vertx, null);
+                mock(Instance.class), config, vertx, null, null, null, authorizer);
     }
 
     private static LambdaFunction function(String account, String region) {
@@ -155,10 +160,23 @@ class AslExecutorLambdaArnTargetTest {
     }
 
     @Test
-    void underIamEnforcementAFunctionArnInAnotherAccountIsRefused() {
-        EmulatorConfig enforcing = mock(EmulatorConfig.class, RETURNS_DEEP_STUBS);
-        when(enforcing.services().iam().enforcementEnabled()).thenReturn(true);
-        executor = newExecutor(enforcing);
+    void underIamEnforcementAFunctionInAnotherAccountRunsWhenItsPolicyAndTheRolesAllowIt() throws Exception {
+        LambdaTaskAuthorizer authorizer = enforcing();
+        when(authorizer.refusal(ROLE_ARN, functionArn(OTHER_ACCOUNT, REGION))).thenReturn(Optional.empty());
+
+        Execution execution = run("""
+                {"StartAt": "Call", "States": {"Call": {"Type": "Task", "Resource": "%s", "End": true}}}
+                """.formatted(functionArn(OTHER_ACCOUNT, REGION)));
+
+        assertEquals("SUCCEEDED", execution.getStatus());
+        assertEquals(functionArn(OTHER_ACCOUNT, REGION),
+                objectMapper.readTree(execution.getOutput()).path("invoked").asText());
+    }
+
+    @Test
+    void underIamEnforcementAFunctionInAnotherAccountIsRefusedWithTheAuthorizersReason() {
+        LambdaTaskAuthorizer authorizer = enforcing();
+        when(authorizer.refusal(ROLE_ARN, functionArn(OTHER_ACCOUNT, REGION))).thenReturn(Optional.of("refused"));
 
         Execution execution = run("""
                 {"StartAt": "Call", "States": {"Call": {"Type": "Task", "Resource": "%s", "End": true}}}
@@ -166,6 +184,59 @@ class AslExecutorLambdaArnTargetTest {
 
         assertEquals("FAILED", execution.getStatus());
         assertEquals("Lambda.AccessDeniedException", execution.getError());
+        assertEquals("refused", execution.getCause());
+        verify(lambdaExecutor, never()).invoke(any(), any(byte[].class), any());
+    }
+
+    @Test
+    void underIamEnforcementTheFunctionIsAuthorizedAsTheTaskNamesIt() {
+        LambdaTaskAuthorizer authorizer = enforcing();
+        when(authorizer.refusal(anyString(), anyString())).thenReturn(Optional.of("refused"));
+
+        run("""
+                {"StartAt": "Call", "States": {"Call": {"Type": "Task",
+                  "Resource": "arn:aws:states:::lambda:invoke",
+                  "Parameters": {"FunctionName": "%s:function:%s:live"}, "End": true}}}
+                """.formatted(OTHER_ACCOUNT, FUNCTION_NAME));
+
+        verify(authorizer).refusal(ROLE_ARN, functionArn(OTHER_ACCOUNT, REGION) + ":live");
+    }
+
+    @Test
+    void underIamEnforcementAFullFunctionArnIsAuthorizedAsItIsWritten() {
+        LambdaTaskAuthorizer authorizer = enforcing();
+        when(authorizer.refusal(anyString(), anyString())).thenReturn(Optional.of("refused"));
+        String chinaFunction = "arn:aws-cn:lambda:cn-north-1:%s:function:%s:7".formatted(OTHER_ACCOUNT, FUNCTION_NAME);
+
+        run("""
+                {"StartAt": "Call", "States": {"Call": {"Type": "Task", "Resource": "%s", "End": true}}}
+                """.formatted(chinaFunction));
+
+        verify(authorizer).refusal(ROLE_ARN, chinaFunction);
+    }
+
+    @Test
+    void underIamEnforcementAFunctionInTheStateMachinesAccountIsAuthorizedToo() {
+        LambdaTaskAuthorizer authorizer = enforcing();
+        when(authorizer.refusal(ROLE_ARN, functionArn(ACCOUNT, REGION))).thenReturn(Optional.of("refused"));
+
+        Execution execution = run("""
+                {"StartAt": "Call", "States": {"Call": {"Type": "Task",
+                  "Resource": "arn:aws:states:::lambda:invoke",
+                  "Parameters": {"FunctionName": "%s"}, "End": true}}}
+                """.formatted(FUNCTION_NAME));
+
+        assertEquals("FAILED", execution.getStatus());
+        assertEquals("Lambda.AccessDeniedException", execution.getError());
+        verify(lambdaExecutor, never()).invoke(any(), any(byte[].class), any());
+    }
+
+    private LambdaTaskAuthorizer enforcing() {
+        EmulatorConfig enforcing = mock(EmulatorConfig.class, RETURNS_DEEP_STUBS);
+        when(enforcing.services().iam().enforcementEnabled()).thenReturn(true);
+        LambdaTaskAuthorizer authorizer = mock(LambdaTaskAuthorizer.class);
+        executor = newExecutor(enforcing, authorizer);
+        return authorizer;
     }
 
     private Execution run(String definition) {
@@ -173,7 +244,7 @@ class AslExecutorLambdaArnTargetTest {
         stateMachine.setName("lambda-arn-target");
         stateMachine.setStateMachineArn(
                 "arn:aws:states:%s:%s:stateMachine:lambda-arn-target".formatted(REGION, ACCOUNT));
-        stateMachine.setRoleArn("arn:aws:iam::%s:role/test-role".formatted(ACCOUNT));
+        stateMachine.setRoleArn(ROLE_ARN);
         stateMachine.setDefinition(definition);
 
         Execution execution = new Execution();

@@ -472,6 +472,19 @@ for the integration that raised it: `StepFunctions.ExecutionAlreadyExistsExcepti
 `aws-sdk:sfn:startExecution`. An Express child starts a new execution instead, so the same `Name`
 never fails it.
 
+## Lambda tasks under IAM enforcement
+
+A Lambda task, given a function ARN as its `Resource` or as the `FunctionName` of
+`arn:aws:states:::lambda:invoke`, runs the function in the account and Region the ARN names. With
+[IAM enforcement](iam.md#resource-based-policies) on, the task invokes the function as the state
+machine's execution role, as on AWS. In the role's own account, the role's policies or the
+function's policy can allow `lambda:InvokeFunction`. For a function in another account, both have
+to: the role's policies, and the function's policy through, for example, `AddPermission` naming the
+role or its account. The role's permissions boundary and its account's service control policies
+apply too, and a Deny in any of them refuses the call. A task that names a version or alias is
+authorized against that version or alias. A refused task fails with `Lambda.AccessDeniedException`,
+whose cause names the role's session and the kind of policy that refused it.
+
 ## AWS SDK task integrations
 
 A resource of the form `arn:aws:states:::aws-sdk:<service>:<action>` calls the service's API and

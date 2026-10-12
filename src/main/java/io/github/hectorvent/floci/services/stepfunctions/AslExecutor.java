@@ -104,6 +104,7 @@ import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Locale;
 import java.util.Map;
+import java.util.Optional;
 import java.util.Random;
 import java.util.Set;
 import java.util.UUID;
@@ -255,6 +256,7 @@ public class AslExecutor {
     private final RdsDataService rdsDataService;
     private final RedshiftDataJsonHandler redshiftDataHandler;
     private final ServiceRegistry serviceRegistry;
+    private final LambdaTaskAuthorizer lambdaTaskAuthorizer;
     private final ObjectMapper objectMapper;
     private final Configuration jsonPathConfiguration;
     private final JsonataEvaluator jsonataEvaluator;
@@ -285,13 +287,14 @@ public class AslExecutor {
                        ObjectMapper objectMapper, JsonataEvaluator jsonataEvaluator,
                        Instance<StepFunctionsService> sfnService, EmulatorConfig config, Vertx vertx,
                        CustomResourceLiveness customResourceLiveness, RedshiftDataJsonHandler redshiftDataHandler,
-                       ServiceRegistry serviceRegistry) {
+                       ServiceRegistry serviceRegistry, LambdaTaskAuthorizer lambdaTaskAuthorizer) {
         this(lambdaExecutor, targetResolver, dynamoDb, dynamoDbJsonHandler,
                 sqsJsonHandler, snsJsonHandler, cloudFormationHandler,
                 ec2Service, s3Service, ecsService, ecsJsonHandler,
                 eventBridgeHandler, schedulerService, schedulerController, rdsDataService,
                 objectMapper, jsonataEvaluator, sfnService, config, vertx, customResourceLiveness,
-                Clock.systemUTC(), TimeUnit.NANOSECONDS::sleep, null, redshiftDataHandler, serviceRegistry);
+                Clock.systemUTC(), TimeUnit.NANOSECONDS::sleep, null, redshiftDataHandler, serviceRegistry,
+                lambdaTaskAuthorizer);
     }
 
     AslExecutor(LambdaExecutorService lambdaExecutor, LambdaTargetResolver targetResolver,
@@ -306,8 +309,10 @@ public class AslExecutor {
                 Instance<StepFunctionsService> sfnService, EmulatorConfig config, Vertx vertx,
                 CustomResourceLiveness customResourceLiveness,
                 Clock clock, Sleeper sleeper, Integer maxWaitSecondsOverride,
-                RedshiftDataJsonHandler redshiftDataHandler, ServiceRegistry serviceRegistry) {
+                RedshiftDataJsonHandler redshiftDataHandler, ServiceRegistry serviceRegistry,
+                LambdaTaskAuthorizer lambdaTaskAuthorizer) {
         this.serviceRegistry = serviceRegistry;
+        this.lambdaTaskAuthorizer = lambdaTaskAuthorizer;
         this.customResourceLiveness = customResourceLiveness;
         this.redshiftDataHandler = redshiftDataHandler;
         this.lambdaExecutor = lambdaExecutor;
@@ -364,7 +369,7 @@ public class AslExecutor {
                 ec2Service, s3Service, ecsService, ecsJsonHandler,
                 eventBridgeHandler, schedulerService, schedulerController, rdsDataService,
                 objectMapper, jsonataEvaluator, sfnService, config, vertx, customResourceLiveness,
-                Clock.systemUTC(), TimeUnit.NANOSECONDS::sleep, null, null, null);
+                Clock.systemUTC(), TimeUnit.NANOSECONDS::sleep, null, null, null, null);
     }
 
     // Kept for tests that do not exercise the Redshift Data API integration.
@@ -385,7 +390,7 @@ public class AslExecutor {
                 ec2Service, s3Service, ecsService, ecsJsonHandler,
                 eventBridgeHandler, schedulerService, schedulerController, rdsDataService,
                 objectMapper, jsonataEvaluator, sfnService, config, vertx, customResourceLiveness,
-                clock, sleeper, maxWaitSecondsOverride, null, null);
+                clock, sleeper, maxWaitSecondsOverride, null, null, null);
     }
 
     AslExecutor(LambdaExecutorService lambdaExecutor, LambdaFunctionStore functionStore,
@@ -1187,13 +1192,15 @@ public class AslExecutor {
             String region = ref.region() != null ? ref.region() : stateMachineArn.region();
             String accountId = ref.account() == null || ref.account().equals(stateMachineArn.accountId())
                     ? null : ref.account();
-            // Floci evaluates no Lambda resource policy, so under IAM enforcement it answers a
-            // cross-account function as its own Invoke API does: refused.
-            if (accountId != null && iamEnforcementEnabled()) {
-                throw new FailStateException("Lambda.AccessDeniedException",
-                        "User: " + sm.getRoleArn() + " is not authorized to perform: lambda:InvokeFunction"
-                                + " on resource: " + functionRef
-                                + " because no resource-based policy allows the lambda:InvokeFunction action");
+            // The task invokes the function as the execution role, which the role's policies or the
+            // function's have to allow, and both when the function is in another account.
+            if (iamEnforcementEnabled()) {
+                String functionArn = LambdaArnUtils.functionArn(functionRef, stateMachineArn.partition(), region,
+                        stateMachineArn.accountId());
+                Optional<String> refusal = lambdaTaskAuthorizer.refusal(sm.getRoleArn(), functionArn);
+                if (refusal.isPresent()) {
+                    throw new FailStateException("Lambda.AccessDeniedException", refusal.get());
+                }
             }
             LambdaFunction fn = resolveLambdaFunction(accountId, region, functionName,
                     extractLambdaQualifier(functionRef));

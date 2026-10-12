@@ -84,6 +84,8 @@ part in authorizing calls to the function:
 - An invoke of a function named by a full or partial ARN runs the function in the account in the
   ARN. An invoke of another account's function needs its function policy to allow the caller as
   well as the caller's own identity policy.
+- A Step Functions Lambda task is authorized the same way, as the state machine's execution role;
+  see [Step Functions](step-functions.md#lambda-tasks-under-iam-enforcement).
 - `GetFunction`, `GetFunctionConfiguration` and `ListDurableExecutionsByFunction`, given a full ARN
   with a version or alias, read the function in the account in the ARN, and need its function
   policy to allow the caller in the same way.
